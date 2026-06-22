@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Desk — attention race (neuron + dopamine demo)</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; background: #1b1b22; color: #e6e9ef;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size: 16px; margin: 10px 14px 4px; }
+  .sub { margin: 0 14px 8px; color: #95a0b0; font-size: 12px; }
+  #topbar {
+    display: flex; flex-wrap: wrap; gap: 18px; align-items: center;
+    padding: 10px 14px; background: #23232c; border-bottom: 1px solid #33333f;
+  }
+  #topbar label { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  #topbar .val { color: #16a085; font-weight: 700; min-width: 22px; text-align: right; }
+  #topbar .rval { color: #e67e22; }
+  input[type=range] { width: 150px; accent-color: #16a085; }
+  #rewardSlider { accent-color: #e67e22; }
+  button {
+    background: #2f3140; color: #e6e9ef; border: 1px solid #4a4d60;
+    border-radius: 6px; padding: 7px 12px; cursor: pointer; font-weight: 600;
+  }
+  button:hover { background: #3a3d4f; }
+  #main {
+    display: flex; flex-wrap: wrap; gap: 16px; padding: 14px; align-items: flex-start;
+  }
+  .col { display: flex; flex-direction: column; gap: 10px; }
+  canvas { background: #0e0e12; border-radius: 8px; display: block; }
+  .panelTitle { font-size: 12px; color: #c8d0dc; font-weight: 600; }
+  .hidden { display: none; }
+  .objbox {
+    background: #23232c; border: 1px solid #33333f; border-radius: 8px;
+    padding: 8px 10px; min-width: 150px;
+  }
+  .objbox h3 { margin: 0 0 6px; font-size: 13px; }
+  .objbox .name-phone { color: #e67e22; }
+  .objbox .name-home { color: #2e86de; }
+  .objrow { display: flex; gap: 14px; flex-wrap: wrap; }
+  .efforts label, .objbox > label { display: flex; align-items: center; gap: 5px; font-size: 12px; }
+  .efforts { display: flex; flex-direction: column; gap: 2px; }
+  .legend { color: #8a93a3; font-size: 11px; margin: 0 14px 14px; }
+</style>
+</head>
+<body>
+  <h1>Desk — attention race</h1>
+  <p class="sub">Each object's neurons drift to threshold and spike into its attention accumulator; first to the line wins.
+     Click an object on the desk to watch its neurons, then click a neuron for its dopamine cascade + drift-diffusion (DDM) view.</p>
+
+  <div id="topbar">
+    <label>Neurons <input type="range" id="neuronSlider" min="1" max="36" step="1" value="18"><span class="val" id="neuronVal">18</span></label>
+    <label>Reward <input type="range" id="rewardSlider" min="0" max="25" step="0.5" value="8"><span class="val rval" id="rewardVal">8</span></label>
+    <button id="notifyBtn">Send notification&nbsp;to&nbsp;phone</button>
+    <label>Show: <input type="checkbox" id="toggleCascade" checked> Cascade</label>
+    <label><input type="checkbox" id="toggleDDM" checked> DDM</label>
+  </div>
+
+  <div id="main">
+    <div class="col">
+      <canvas id="desk" width="380" height="260"></canvas>
+      <div class="objrow" id="objControls"></div>
+    </div>
+
+    <div class="col">
+      <div class="panelTitle">Attention race</div>
+      <canvas id="race" width="240" height="170"></canvas>
+    </div>
+
+    <div class="col">
+      <div id="wrapPhone" class="hidden">
+        <div class="panelTitle" id="titlePhone">Phone neurons</div>
+        <canvas id="panelPhone" width="300" height="160"></canvas>
+      </div>
+      <div id="wrapHome" class="hidden">
+        <div class="panelTitle" id="titleHome">Homework neurons</div>
+        <canvas id="panelHome" width="300" height="160"></canvas>
+      </div>
+    </div>
+
+    <div class="col">
+      <canvas id="ddm" class="hidden" width="280" height="220"></canvas>
+      <canvas id="cascade" class="hidden" width="360" height="330"></canvas>
+    </div>
+  </div>
+
+  <p class="legend">Flash at "Dopamine release" = the surprise (prediction error δ); the four bars = the steady learned value flowing
+     receptor → Gs/Gi → adenylyl cyclase → cAMP → PKA → ion channel → drive. Drag <b>Neurons</b> below 7 for per-neuron traces, above 6 for the light-up grid.</p>
+
+<script>
+"use strict";
+
+// ---------- constants (mirrors main.py) ----------
+const P = { V_REST:-70, V_THRESH:-55, V_RESET:-70, V_SPIKE:40, TAU:12, DT:0.5, NOISE_SD:2.3 };
+const EFFORT_COST = 11.5, WINDOW = 200, GRID_THRESHOLD = 6, FRAME_MS = 30,
+      RACE_THRESHOLD = 50, NOTIF_BOOST = 16, LEARN_RATE = 0.25, REWARD_SD = 5,
+      VAL_MAX = 25, PHASIC_MAX = 12, N_NEURONS = 18;
+const EFFORT_CHOICES = [["On desk",0.0],["In bag",0.4],["Across room",1.0],["Far away",1.4]];
+
+// standard-normal sample (Box–Muller)
+function gauss() {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+const clamp01 = x => Math.max(0, Math.min(1, x));
+
+// ---------- population of leaky-integrator neurons ----------
+class Population {
+  constructor(option, n) {
+    this.option = option;
+    this.n = n;
+    this.v = new Array(n).fill(P.V_REST);
+    this.spiked = new Array(n).fill(false);
+    this.brightness = new Float32Array(n);
+    this.boost = 0;          // transient drive from a notification
+    this.phasic = 0;         // last outcome's prediction error, decays
+    // history kept as a ring buffer per neuron
+    this.buf = [];
+    for (let k = 0; k < n; k++) this.buf.push(new Float32Array(WINDOW).fill(P.V_REST));
+    this.hidx = 0;
+    this.cols = Math.ceil(Math.sqrt(n));
+    this.rows = Math.ceil(n / this.cols);
+  }
+  effectiveDrive() {
+    return this.option.value - this.option.effort * EFFORT_COST + this.boost;
+  }
+  step() {
+    const drive = this.effectiveDrive();
+    this.boost *= 0.92;
+    this.phasic *= 0.85;
+    let fired = 0;
+    for (let k = 0; k < this.n; k++) {
+      this.brightness[k] *= 0.75;
+      if (this.spiked[k]) {
+        this.v[k] = P.V_RESET;
+        this.spiked[k] = false;
+      } else {
+        const dv = ((-(this.v[k] - P.V_REST) + drive) / P.TAU) * P.DT
+                 + P.NOISE_SD * Math.sqrt(P.DT) * gauss();
+        let nv = this.v[k] + dv;
+        if (nv >= P.V_THRESH) {
+          nv = P.V_SPIKE;
+          this.spiked[k] = true;
+          this.brightness[k] = 1;
+          fired++;
+        }
+        this.v[k] = nv;
+      }
+      this.buf[k][this.hidx] = this.v[k];
+    }
+    this.hidx = (this.hidx + 1) % WINDOW;
+    return fired;
+  }
+  // ordered history (oldest -> newest) for neuron k
+  hist(k) {
+    const out = new Float32Array(WINDOW), b = this.buf[k];
+    for (let i = 0; i < WINDOW; i++) out[i] = b[(this.hidx + i) % WINDOW];
+    return out;
+  }
+}
+
+// ---------- desk objects ----------
+function makeObject(name, value, effort, color, cssClass) {
+  return {
+    option: { name, value, effort, present: true, color },
+    color, cssClass,
+    pop: null, acc: 0, shown: false, rect: null,
+  };
+}
+function spawn(obj, n) {
+  obj.option.present = true;
+  obj.pop = new Population(obj.option, n);
+}
+
+const app = {
+  nNeurons: N_NEURONS,
+  rewardVal: 8,
+  showCascade: true,
+  showDDM: true,
+  winner: null,
+  selObj: null,   // object whose neuron is selected
+  selK: 0,        // selected neuron index
+};
+const phone = makeObject("Phone", 18.0, 0.4, "#e67e22", "phone");
+const home  = makeObject("Homework", 13.0, 0.0, "#2e86de", "home");
+app.objects = [phone, home];
+spawn(phone, app.nNeurons);
+spawn(home, app.nNeurons);
+
+// ---------- canvases ----------
+function setup(id) {
+  const c = document.getElementById(id);
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.width, h = c.height;
+  c.style.width = w + "px"; c.style.height = h + "px";
+  c.width = w * dpr; c.height = h * dpr;
+  const ctx = c.getContext("2d");
+  ctx.scale(dpr, dpr);
+  return { c, ctx, w, h };
+}
+const DESK = setup("desk");
+const RACE = setup("race");
+const PANEL = { phone: setup("panelPhone"), home: setup("panelHome") };
+const CAS = setup("cascade");
+const DDM = setup("ddm");
+
+// ---------- colour helpers ----------
+const INFERNO = [[0,0,4],[40,11,84],[101,21,110],[159,42,99],[212,72,66],
+                 [245,125,21],[250,193,39],[252,255,164]];
+function inferno(t) {
+  t = clamp01(t);
+  const s = t * (INFERNO.length - 1), i = Math.floor(s), f = s - i;
+  const a = INFERNO[i], b = INFERNO[Math.min(i + 1, INFERNO.length - 1)];
+  const r = Math.round(a[0] + (b[0] - a[0]) * f),
+        g = Math.round(a[1] + (b[1] - a[1]) * f),
+        bl = Math.round(a[2] + (b[2] - a[2]) * f);
+  return `rgb(${r},${g},${bl})`;
+}
+function neuronColor(k, n) { return `hsl(${260 - (k / Math.max(1, n - 1)) * 200}, 65%, 58%)`; }
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function arrow(ctx, x0, y0, x1, y1, color, lw) {
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw || 1.6;
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  const ang = Math.atan2(y1 - y0, x1 - x0), s = 6;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 - s * Math.cos(ang - 0.4), y1 - s * Math.sin(ang - 0.4));
+  ctx.lineTo(x1 - s * Math.cos(ang + 0.4), y1 - s * Math.sin(ang + 0.4));
+  ctx.closePath(); ctx.fill();
+}
+
+// ---------- desk scene ----------
+function drawDesk() {
+  const { ctx, w, h } = DESK;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#1b1b22"; ctx.fillRect(0, 0, w, h);
+  // table
+  ctx.fillStyle = "#a9744f"; ctx.strokeStyle = "#7a5436"; ctx.lineWidth = 2;
+  roundRect(ctx, 18, 120, w - 36, 120, 8); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "#cbb79f"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("Desk", w / 2, 232);
+  ctx.fillStyle = "#9aa6b6";
+  ctx.fillText("Click an object to watch its neurons", w / 2, 24);
+
+  // homework sheet (centred)
+  const hwr = { x: 120, y: 96, w: 90, h: 110 };
+  home.rect = home.option.present ? hwr : null;
+  if (home.option.present) {
+    ctx.fillStyle = "#fdfdf6"; ctx.strokeStyle = "#cfcfc0"; ctx.lineWidth = 1.5;
+    roundRect(ctx, hwr.x, hwr.y, hwr.w, hwr.h, 3); ctx.fill(); ctx.stroke();
+    ctx.strokeStyle = "#bcc6d6"; ctx.lineWidth = 0.8;
+    for (let i = 0; i < 5; i++) {
+      const ly = hwr.y + 18 + i * 18;
+      ctx.beginPath(); ctx.moveTo(hwr.x + 10, ly); ctx.lineTo(hwr.x + hwr.w - 10, ly); ctx.stroke();
+    }
+    if (app.winner === home) { ctx.strokeStyle = "#f1c40f"; ctx.lineWidth = 4; roundRect(ctx, hwr.x, hwr.y, hwr.w, hwr.h, 3); ctx.stroke(); }
+  }
+
+  // phone (size/position by effort: farther = smaller & higher)
+  phone.rect = null;
+  if (phone.option.present) {
+    const frac = Math.min(phone.option.effort / 1.5, 1);
+    const pw = 52 - 18 * frac, ph = 92 - 34 * frac;
+    const cx = 300 + 10 * frac, cy = 188 - 70 * frac;
+    const pr = { x: cx - pw / 2, y: cy - ph / 2, w: pw, h: ph };
+    phone.rect = pr;
+    ctx.fillStyle = "#2c3e50"; ctx.strokeStyle = "#1a252f"; ctx.lineWidth = 1.5;
+    roundRect(ctx, pr.x, pr.y, pr.w, pr.h, 6); ctx.fill(); ctx.stroke();
+    if (app.winner === phone) { ctx.strokeStyle = "#f1c40f"; ctx.lineWidth = 4; roundRect(ctx, pr.x, pr.y, pr.w, pr.h, 6); ctx.stroke(); }
+    if (phone.pop && phone.pop.boost > 1) {
+      ctx.fillStyle = "#e74c3c"; ctx.font = "bold 12px sans-serif";
+      ctx.fillText("buzz!", cx, pr.y - 6);
+    }
+  }
+}
+
+// ---------- attention race ----------
+function drawRace() {
+  const { ctx, w, h } = RACE;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#0e0e12"; ctx.fillRect(0, 0, w, h);
+  const ml = 70, mr = 14, barH = 26, gap = 28, top = 40;
+  const full = w - ml - mr;
+  ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.font = "12px sans-serif";
+  app.objects.forEach((o, i) => {
+    const y = top + i * (barH + gap);
+    ctx.fillStyle = "#9aa6b6"; ctx.fillText(o.option.name, ml - 8, y + barH / 2);
+    ctx.strokeStyle = "#3a3d4f"; ctx.lineWidth = 1; ctx.strokeRect(ml, y, full, barH);
+    const frac = o.option.present ? clamp01(o.acc / RACE_THRESHOLD) : 0;
+    ctx.fillStyle = o.color; ctx.fillRect(ml, y, full * frac, barH);
+  });
+  // threshold line
+  ctx.strokeStyle = "#c0392b"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(ml + full, top - 6); ctx.lineTo(ml + full, top + 2 * (barH + gap)); ctx.stroke();
+  ctx.fillStyle = "#c0392b"; ctx.textAlign = "right"; ctx.font = "10px sans-serif";
+  ctx.fillText("win", ml + full - 2, 20);
+}
+
+// ---------- neuron panel (grid for many, traces for few) ----------
+function panelMode(pop) { return pop.n > GRID_THRESHOLD ? "grid" : "trace"; }
+
+function drawPanel(obj, P2) {
+  const { ctx, w, h } = P2;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#111118"; ctx.fillRect(0, 0, w, h);
+  const pop = obj.pop;
+  if (!pop) return;
+  if (panelMode(pop) === "grid") {
+    const cellW = w / pop.cols, cellH = h / pop.rows;
+    for (let r = 0; r < pop.rows; r++) for (let c = 0; c < pop.cols; c++) {
+      const k = r * pop.cols + c;
+      ctx.fillStyle = k < pop.n ? inferno(pop.brightness[k]) : "#202020";
+      ctx.fillRect(c * cellW + 1, r * cellH + 1, cellW - 2, cellH - 2);
+    }
+  } else {
+    const ml = 6, mr = 6, mt = 6, mb = 6;
+    const X = i => ml + (i / (WINDOW - 1)) * (w - ml - mr);
+    const Y = v => mt + ((50 - v) / (50 + 82)) * (h - mt - mb);
+    ctx.strokeStyle = "#c0392b"; ctx.setLineDash([4, 3]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(ml, Y(P.V_THRESH)); ctx.lineTo(w - mr, Y(P.V_THRESH)); ctx.stroke();
+    ctx.strokeStyle = "#7f8c8d"; ctx.setLineDash([1, 3]);
+    ctx.beginPath(); ctx.moveTo(ml, Y(P.V_REST)); ctx.lineTo(w - mr, Y(P.V_REST)); ctx.stroke();
+    ctx.setLineDash([]);
+    for (let k = 0; k < pop.n; k++) {
+      const hh = pop.hist(k);
+      ctx.strokeStyle = neuronColor(k, pop.n); ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      for (let i = 0; i < WINDOW; i++) { const px = X(i), py = Y(hh[i]); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }
+      ctx.stroke();
+    }
+  }
+  // highlight the selected neuron's cell in grid mode
+  if (app.selObj === obj && panelMode(pop) === "grid") {
+    const cellW = w / pop.cols, cellH = h / pop.rows;
+    const r = Math.floor(app.selK / pop.cols), c = app.selK % pop.cols;
+    ctx.strokeStyle = "#f1c40f"; ctx.lineWidth = 2;
+    ctx.strokeRect(c * cellW + 1, r * cellH + 1, cellW - 2, cellH - 2);
+  }
+}
+
+function panelClickIndex(obj, P2, mx, my) {
+  const pop = obj.pop; if (!pop) return null;
+  const { w, h } = P2;
+  if (panelMode(pop) === "grid") {
+    const cellW = w / pop.cols, cellH = h / pop.rows;
+    const c = Math.floor(mx / cellW), r = Math.floor(my / cellH);
+    if (c < 0 || c >= pop.cols || r < 0 || r >= pop.rows) return null;
+    const k = r * pop.cols + c;
+    return k < pop.n ? k : null;
+  }
+  // trace mode: pick the neuron whose trace is nearest the click point
+  const ml = 6, mr = 6, mt = 6, mb = 6;
+  let ti = Math.round((mx - ml) / (w - ml - mr) * (WINDOW - 1));
+  ti = Math.max(0, Math.min(WINDOW - 1, ti));
+  const v = 50 - ((my - mt) / (h - mt - mb)) * (50 + 82);
+  let best = 0, bestd = Infinity;
+  for (let k = 0; k < pop.n; k++) {
+    const d = Math.abs(pop.hist(k)[ti] - v);
+    if (d < bestd) { bestd = d; best = k; }
+  }
+  return best;
+}
+
+// ---------- dopamine cascade ----------
+function casNode(ctx, X, Y, x, y, text, fc, fs) {
+  ctx.font = (fs || 9) + "px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const lines = text.split("\n");
+  const tw = Math.max(...lines.map(l => ctx.measureText(l).width)) + 12;
+  const th = lines.length * (fs || 9) * 1.25 + 8;
+  const px = X(x), py = Y(y);
+  ctx.fillStyle = fc; ctx.strokeStyle = "#fff"; ctx.lineWidth = 1;
+  roundRect(ctx, px - tw / 2, py - th / 2, tw, th, 5); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "#fff";
+  lines.forEach((l, i) => ctx.fillText(l, px, py - th / 2 + 4 + (i + 0.5) * (fs || 9) * 1.25));
+}
+
+function drawCascade() {
+  const { ctx, w, h } = CAS;
+  const obj = app.selObj; if (!obj) return;
+  const value = obj.option.value;
+  const phasic = obj.pop ? obj.pop.phasic : 0;
+  const drive = obj.pop ? obj.pop.effectiveDrive() : value;
+  const sx = w / 10, sy = h / 12;
+  const X = x => x * sx, Y = y => h - y * sy;     // reuse main.py 10x12 layout
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#15151c"; ctx.fillRect(0, 0, w, h);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+
+  ctx.fillStyle = "#ecf0f1"; ctx.font = "bold 13px sans-serif";
+  ctx.fillText(obj.option.name + ": dopamine cascade", X(5), Y(11.4));
+  ctx.fillStyle = "#7f8c9b"; ctx.font = "italic 9px sans-serif";
+  ctx.fillText("PHASIC: surprise burst", X(5), Y(10.55));
+
+  // phasic flash at dopamine release
+  const mag = clamp01(Math.abs(phasic) / PHASIC_MAX), up = phasic >= 0;
+  ctx.beginPath();
+  ctx.fillStyle = up ? "#2ecc71" : "#e74c3c";
+  ctx.globalAlpha = 0.15 + 0.7 * mag;
+  ctx.arc(X(5), Y(9.7), (0.45 + 1.1 * mag) * sx, 0, 2 * Math.PI); ctx.fill();
+  ctx.globalAlpha = 1;
+  casNode(ctx, X, Y, 5, 9.7, "Dopamine\nrelease", "#9b59b6", 9);
+  ctx.fillStyle = up ? "#2ecc71" : "#e74c3c"; ctx.font = "bold 13px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("δ = " + (phasic >= 0 ? "+" : "") + phasic.toFixed(1), X(7.6), Y(9.7));
+  ctx.textAlign = "center";
+
+  // receptor arms light up with the sign of the surprise
+  arrow(ctx, X(4.3), Y(9.3), X(3.3), Y(8.7), "#9aa0a6");
+  arrow(ctx, X(5.7), Y(9.3), X(6.7), Y(8.7), "#9aa0a6");
+  const d1 = 0.75 * clamp01(Math.max(0, phasic) / PHASIC_MAX);
+  const d2 = 0.75 * clamp01(Math.max(0, -phasic) / PHASIC_MAX);
+  ctx.globalAlpha = d1; ctx.fillStyle = "#2ecc71"; ctx.beginPath(); ctx.arc(X(2.8), Y(8.2), 1.05 * sx, 0, 6.3); ctx.fill();
+  ctx.globalAlpha = d2; ctx.fillStyle = "#e74c3c"; ctx.beginPath(); ctx.arc(X(7.2), Y(8.2), 1.05 * sx, 0, 6.3); ctx.fill();
+  ctx.globalAlpha = 1;
+  casNode(ctx, X, Y, 2.8, 8.2, "D1\n(Gs)", "#27ae60", 8);
+  casNode(ctx, X, Y, 7.2, 8.2, "D2\n(Gi)", "#c0392b", 8);
+  ctx.font = "8px sans-serif"; ctx.fillStyle = "#2ecc71"; ctx.fillText("+ cAMP", X(2.8), Y(7.25));
+  ctx.fillStyle = "#e74c3c"; ctx.fillText("− cAMP", X(7.2), Y(7.25));
+  arrow(ctx, X(3.1), Y(7.0), X(4.4), Y(6.75), "#2ecc71");
+  arrow(ctx, X(6.9), Y(7.0), X(5.6), Y(6.75), "#e74c3c");
+  casNode(ctx, X, Y, 5, 6.45, "Adenylyl cyclase", "#34495e", 8);
+
+  // steady tonic cascade -> labelled gauges
+  ctx.fillStyle = "#7f8c9b"; ctx.font = "italic 8px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("STEADY: from value ↓", X(0.2), Y(5.62));
+  const tonic = clamp01(value / VAL_MAX);
+  const gauges = [
+    ["cAMP", tonic, 5.0], ["PKA", Math.pow(tonic, 1.1), 3.95],
+    ["Ion channel", tonic, 2.9], ["Drive", clamp01(drive / VAL_MAX), 1.85],
+  ];
+  const gx = 3.4, gw = 4.3, gh = 0.55;
+  for (const [label, lv, gy] of gauges) {
+    ctx.fillStyle = "#2a2a33"; ctx.fillRect(X(gx), Y(gy + gh), gw * sx, gh * sy);
+    ctx.strokeStyle = "#888"; ctx.lineWidth = 1; ctx.strokeRect(X(gx), Y(gy + gh), gw * sx, gh * sy);
+    ctx.fillStyle = obj.color; ctx.fillRect(X(gx), Y(gy + gh), gw * lv * sx, gh * sy);
+    ctx.fillStyle = "#ecf0f1"; ctx.font = "9px sans-serif"; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    ctx.fillText(label, X(gx) - 4, Y(gy + gh / 2));
+    ctx.fillStyle = "#ced6e0"; ctx.textAlign = "left";
+    ctx.fillText(Math.round(lv * 100) + "%", X(gx + gw) + 4, Y(gy + gh / 2));
+  }
+  ctx.fillStyle = obj.color; ctx.font = "bold 11px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("value = " + value.toFixed(1) + "   drive = " + drive.toFixed(1), X(5), Y(1.0));
+}
+
+// ---------- drift-diffusion view of the selected neuron ----------
+function drawDDM() {
+  const { ctx, w, h } = DDM;
+  const obj = app.selObj; if (!obj || !obj.pop || app.selK >= obj.pop.n) return;
+  const pop = obj.pop, k = app.selK;
+  const ml = 8, mr = 8, mt = 24, mb = 18;
+  const lo = P.V_REST - 12, hi = P.V_SPIKE + 8;
+  const X = i => ml + (i / (WINDOW - 1)) * (w - ml - mr);
+  const Y = v => mt + ((hi - v) / (hi - lo)) * (h - mt - mb);
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#0e0e12"; ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = "#cdd3dd"; ctx.font = "bold 11px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+  ctx.fillText(obj.option.name + " neuron #" + k + " — DDM", w / 2, 15);
+
+  const fired = pop.brightness[k] > 0.4;
+  ctx.strokeStyle = fired ? "#ff7675" : "#e74c3c"; ctx.lineWidth = fired ? 2.6 : 1.5; ctx.setLineDash([5, 4]);
+  ctx.beginPath(); ctx.moveTo(ml, Y(P.V_THRESH)); ctx.lineTo(w - mr, Y(P.V_THRESH)); ctx.stroke();
+  ctx.setLineDash([1, 4]); ctx.strokeStyle = "#7f8c8d"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(ml, Y(P.V_REST)); ctx.lineTo(w - mr, Y(P.V_REST)); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#e74c3c"; ctx.font = "8px sans-serif"; ctx.textAlign = "right";
+  ctx.fillText("threshold → fire", w - mr - 2, Y(P.V_THRESH) - 3);
+  ctx.fillStyle = "#95a5a6"; ctx.textAlign = "left";
+  ctx.fillText("start (rest)", ml + 2, Y(P.V_REST) + 11);
+
+  const hh = pop.hist(k);
+  ctx.strokeStyle = obj.color; ctx.lineWidth = 1.6; ctx.beginPath();
+  for (let i = 0; i < WINDOW; i++) { const px = X(i), py = Y(hh[i]); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }
+  ctx.stroke();
+
+  if (fired) {
+    ctx.fillStyle = "#2ecc71"; ctx.font = "bold 13px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("● fired!", w / 2, Y(P.V_SPIKE - 6));
+  }
+}
+
+// ---------- panel visibility ----------
+function syncVisibility() {
+  document.getElementById("wrapPhone").classList.toggle("hidden", !phone.shown);
+  document.getElementById("wrapHome").classList.toggle("hidden", !home.shown);
+  const showCas = app.showCascade && app.selObj;
+  const showDdm = app.showDDM && app.selObj && app.selObj.pop;
+  CAS.c.classList.toggle("hidden", !showCas);
+  DDM.c.classList.toggle("hidden", !showDdm);
+}
+
+// ---------- selection ----------
+function selectNeuron(obj, k) {
+  if (k === null) return;
+  app.selObj = obj; app.selK = k;
+  syncVisibility();
+}
+
+// ---------- notification (reward-prediction-error learning) ----------
+function notify() {
+  if (!phone.pop) return;
+  phone.pop.boost += NOTIF_BOOST;
+  const reward = Math.max(0, app.rewardVal + REWARD_SD * gauss());
+  const delta = reward - phone.option.value;
+  phone.pop.phasic = delta;
+  phone.option.value += LEARN_RATE * delta;
+}
+
+// ---------- resize the neuron pools ----------
+function setNeuronCount(n) {
+  if (n === app.nNeurons) return;
+  app.nNeurons = n;
+  for (const o of app.objects) if (o.option.present) spawn(o, n);
+  if (app.selObj && app.selK >= n) app.selK = 0;
+}
+
+// ---------- main loop ----------
+function tick() {
+  for (const o of app.objects) if (o.pop) o.acc += o.pop.step();
+  const ready = app.objects.filter(o => o.option.present && o.acc >= RACE_THRESHOLD);
+  if (ready.length) {
+    let won = ready[0];
+    for (const o of ready) if (o.acc > won.acc) won = o;
+    app.winner = won;
+    for (const o of app.objects) o.acc = 0;
+  }
+  drawDesk();
+  drawRace();
+  if (phone.shown) drawPanel(phone, PANEL.phone);
+  if (home.shown) drawPanel(home, PANEL.home);
+  if (app.showCascade && app.selObj) drawCascade();
+  if (app.showDDM && app.selObj && app.selObj.pop) drawDDM();
+}
+
+// ---------- input wiring ----------
+function localXY(canvas, e) {
+  const r = canvas.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+}
+DESK.c.addEventListener("click", e => {
+  const [mx, my] = localXY(DESK.c, e);
+  for (const o of app.objects) {
+    const r = o.rect;
+    if (r && mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h) {
+      o.shown = !o.shown;
+      syncVisibility();
+      return;
+    }
+  }
+});
+PANEL.phone.c.addEventListener("click", e => {
+  const [mx, my] = localXY(PANEL.phone.c, e);
+  selectNeuron(phone, panelClickIndex(phone, PANEL.phone, mx, my));
+});
+PANEL.home.c.addEventListener("click", e => {
+  const [mx, my] = localXY(PANEL.home.c, e);
+  selectNeuron(home, panelClickIndex(home, PANEL.home, mx, my));
+});
+
+document.getElementById("neuronSlider").addEventListener("input", e => {
+  const n = parseInt(e.target.value, 10);
+  document.getElementById("neuronVal").textContent = n;
+  setNeuronCount(n);
+});
+document.getElementById("rewardSlider").addEventListener("input", e => {
+  app.rewardVal = parseFloat(e.target.value);
+  document.getElementById("rewardVal").textContent = app.rewardVal;
+});
+document.getElementById("notifyBtn").addEventListener("click", notify);
+document.getElementById("toggleCascade").addEventListener("change", e => {
+  app.showCascade = e.target.checked; syncVisibility();
+});
+document.getElementById("toggleDDM").addEventListener("change", e => {
+  app.showDDM = e.target.checked; syncVisibility();
+});
+
+// ---------- per-object present + effort controls ----------
+function buildObjControls() {
+  const root = document.getElementById("objControls");
+  for (const o of app.objects) {
+    const box = document.createElement("div");
+    box.className = "objbox";
+    const title = `<h3 class="name-${o.cssClass}">${o.option.name}</h3>`;
+    const present = `<label><input type="checkbox" class="pres" ${o.option.present ? "checked" : ""}> Present</label>`;
+    const efforts = EFFORT_CHOICES.map(([lbl, val]) =>
+      `<label><input type="radio" name="eff-${o.cssClass}" value="${val}" ${o.option.effort === val ? "checked" : ""}> ${lbl}</label>`
+    ).join("");
+    box.innerHTML = title + present + `<div class="efforts">${efforts}</div>`;
+    box.querySelector(".pres").addEventListener("change", e => {
+      if (e.target.checked) { spawn(o, app.nNeurons); }
+      else {
+        o.option.present = false; o.pop = null; o.acc = 0; o.shown = false;
+        if (app.winner === o) app.winner = null;
+        if (app.selObj === o) { app.selObj = null; }
+      }
+      syncVisibility();
+    });
+    box.querySelectorAll(`input[name=eff-${o.cssClass}]`).forEach(r =>
+      r.addEventListener("change", e => { o.option.effort = parseFloat(e.target.value); })
+    );
+    root.appendChild(box);
+  }
+}
+buildObjControls();
+syncVisibility();
+setInterval(tick, FRAME_MS);
+</script>
+</body>
+</html>
